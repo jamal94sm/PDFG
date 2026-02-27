@@ -34,8 +34,8 @@ from pathlib import Path
 
 import torch
 
-#from data.dataset import CASIAMultiSpectral, CASIA_SPECTRA
-from models.feature_extractor import MultiDatasetExtractors
+from dataset import CASIAMultiSpectral, CASIA_SPECTRA
+from feature_extractor import MultiDatasetExtractors
 from losses.losses import PDFGLoss
 from trainer import PDFGTrainer
 

@@ -10,7 +10,7 @@ PyTorch implementation of:
 
 ## Overview
 
-PDFG tackles **CDPR-UT** (Cross-Dataset Palmprint Recognition with **Unseen** Target dataset) — the most realistic but hardest scenario where the target dataset is completely unavailable during training.
+PDFG tackles **CDPR-UT** (Cross-Dataset Palmprint Recognition with **Unseen** Target dataset) — the realistic scenario where the target domain is completely unavailable during training.
 
 | Scenario | Target data during training? |
 |---|---|
@@ -18,13 +18,12 @@ PDFG tackles **CDPR-UT** (Cross-Dataset Palmprint Recognition with **Unseen** Ta
 | Standard CDPR | ✅ unlabeled target included |
 | **CDPR-UT (this paper)** | ❌ target is fully unseen |
 
-The method has two generalization stages:
+Two generalization stages are combined:
 
-1. **Data-level** — Fourier-based augmentation mixes amplitude spectra across source datasets to simulate new visual styles (illumination, device response) while preserving palm-line semantics.
-
+1. **Data-level** — Fourier augmentation mixes amplitude spectra across source datasets, generating new styles while preserving palm-line semantics (phase spectrum).
 2. **Feature-level** — Four losses train domain-invariant, discriminative features:
-   - `L_sup` (ArcFace) — supervised discrimination
-   - `L_ada` (MK-MMD) — domain adaptation between source datasets
+   - `L_sup` — ArcFace supervised discrimination (one head per source dataset)
+   - `L_ada` — MK-MMD domain adaptation between source datasets
    - `L_con` — consistent loss: augmented features ≈ original features
    - `L_d-t` — dataset-aware triplet loss: intra-class similarity, inter-class variability
 
@@ -34,12 +33,12 @@ The method has two generalization stages:
 
 ```
 pdfg/
-├── train.py                  ← Entry point
-├── trainer.py                ← Full training loop (PDFGTrainer)
+├── train.py                  ← Entry point (CLI)
+├── trainer.py                ← Two-phase PDFGTrainer
 ├── requirements.txt
 │
 ├── data/
-│   ├── dataset.py            ← CASIAMultiSpectral, CASIASpectrum
+│   ├── dataset.py            ← CASIASpectrum, CASIAMultiSpectral
 │   └── fourier_augment.py    ← Fourier augmentation (Eqs. 2–7)
 │
 ├── models/
@@ -57,7 +56,7 @@ pdfg/
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+pip install torch torchvision pillow numpy
 ```
 
 GPU strongly recommended (paper used NVIDIA 2080Ti).
@@ -68,105 +67,154 @@ GPU strongly recommended (paper used NVIDIA 2080Ti).
 
 ### CASIA Multi-Spectral Palmprint Database
 
-The paper uses 6 spectra: **460, 630, 700, 850, 940, WHT** — 1,200 images each (200 hands).  
-Since you already have ROI images, organize them as one of:
+6 spectra: **460, 630, 700, 850, 940, WHT** — 1,200 images each (200 hands × 6 images).
 
-**Flat layout** (default, `subfolder_mode=False`):
+The dataset loader expects a **single flat folder** containing all `.jpg` files, named with this convention:
+
 ```
-CASIA-MS/
-├── 460/
-│   ├── 001_l_460_01.jpg    ← numeric prefix = subject ID
-│   ├── 001_l_460_02.jpg
-│   ├── 002_l_460_01.jpg
-│   └── ...
-├── 630/
-│   └── ...
-...
+{subject_id}_{hand}_{spectrum}_{iteration}.jpg
 ```
 
-**Subfolder layout** (`--subfolder_mode`):
+Example:
 ```
-CASIA-MS/
-├── 460/
-│   ├── 001/
-│   │   ├── 01.jpg
-│   │   └── 02.jpg
-│   ├── 002/
-│   └── ...
-├── 630/
-...
+/home/pai-ng/Jamal/CASIA-MS-ROI/
+├── 001_l_460_01.jpg
+├── 001_l_460_02.jpg
+├── 001_r_460_01.jpg
+├── 002_l_460_01.jpg
+├── 001_l_700_01.jpg
+├── 001_l_630_01.jpg
+└── ...
 ```
+
+**Identity label** = `subject_id + "_" + hand` (e.g. `"001_l"` and `"001_r"` are two separate identities).  
+The loader automatically filters by spectrum and groups by identity — no manual pre-sorting needed.
+
+**Train/test split**: 3/4 of each identity's images for training, 1/4 for testing (paper convention).
+
+---
+
+## Training Procedure
+
+Training runs in two phases, exactly as described in the paper (Section III-B):
+
+### Phase 1 — Supervised Pre-training (`L_sup` only)
+
+> *"The feature extractors are firstly trained by L_sup using the labeled source images and augmented images."*
+
+- N feature extractors (one per source spectrum), sharing the CNN backbone
+- Each head trained with ArcFace on its own dataset's identity labels
+- Input = **original** source images **+ Fourier-augmented** images `x^{Di→Dj}`
+  - Augmented images carry the same identity label as their source → same head, same class space
+- Shared CNN receives gradients from all N heads simultaneously
+
+### Phase 2 — Full PDFG Training (Eq. 11)
+
+```
+L = L_ArcFace + L_MK-MMD + α·L_con + β·L_d-t
+```
+
+Continues from pre-trained weights, adding cross-dataset losses:
+
+| Loss | Purpose | Default weight |
+|---|---|---|
+| `L_ArcFace` | Discriminative features per dataset | 1.0 |
+| `L_MK-MMD` | Reduce domain shift between source datasets | 1.0 |
+| `L_con` | Augmented features ≈ original features (Eq. 9) | α = 0.1 |
+| `L_d-t` | Triplet: intra-class sim, inter-class var (Eq. 10) | β = 1.0 |
 
 ---
 
 ## Usage
 
-### Single experiment
+### Default run (matches your existing train/test domain setup)
 
 ```bash
-# Sources: 460 + 630,  Target: 700  (matches a Table II row)
-python train.py \
-  --root /path/to/CASIA-MS \
-  --sources 460 630 \
-  --target 700
+python train.py
+# equivalent to:
+python train.py --sources 460 700 630 --target 940
+```
 
-# 3-source experiment
-python train.py \
-  --root /path/to/CASIA-MS \
-  --sources 460 630 700 \
-  --target 850
+### Custom experiment
+
+```bash
+python train.py --sources 460 630 --target 700
+python train.py --sources 460 630 700 --target 850
 ```
 
 ### Run all Table II experiments
 
 ```bash
-python train.py --root /path/to/CASIA-MS --run_all
-```
-
-### Subfolder layout
-
-```bash
-python train.py --root /path/to/CASIA-MS --sources 460 630 --target 700 --subfolder_mode
+python train.py --run_all
 ```
 
 ### Resume from checkpoint
 
 ```bash
-python train.py --root /path/to/CASIA-MS --sources 460 630 --target 700 --resume
+python train.py --sources 460 700 630 --target 940 --resume
 ```
 
 ### All options
 
 ```
---root            Root directory of CASIA-MS ROI data         [required]
---sources         Source spectrum names                        e.g. 460 630 700
---target          Target spectrum name                         e.g. 850
---run_all         Run all Table II paper experiments
+Data
+  --root             Flat folder with all .jpg ROI files
+                     [default: /home/pai-ng/Jamal/CASIA-MS-ROI]
+  --sources          Source spectrum names    [default: 460 700 630]
+  --target           Target spectrum name     [default: 940]
+  --run_all          Run all Table II paper experiments
+  --batch_size       Mini-batch size          [default: 8]
+  --num_workers      DataLoader workers       [default: 2]
+  --seed             Random seed              [default: 42]
 
---subfolder_mode  Images are in per-class subfolders
---batch_size      Mini-batch size                              [default: 8]
---num_workers     DataLoader workers                           [default: 4]
---seed            Random seed                                  [default: 42]
+Model
+  --feature_dim      Output feature dimension [default: 128]
 
---feature_dim     Output feature dimension                     [default: 128]
---alpha           L_con weight α                               [default: 0.1]
---beta            L_d-t weight β                               [default: 1.0]
---arcface_s       ArcFace scale s                              [default: 64.0]
---arcface_m       ArcFace angular margin m                     [default: 0.5]
---lam             Fourier augmentation λ                       [default: 0.8]
+Loss hyperparameters (paper defaults)
+  --alpha            L_con weight α           [default: 0.1]
+  --beta             L_d-t weight β           [default: 1.0]
+  --arcface_s        ArcFace scale s          [default: 64.0]
+  --arcface_m        ArcFace angular margin m [default: 0.5]
+  --lam              Fourier augmentation λ   [default: 0.8]
 
---epochs          Training epochs                              [default: 100]
---steps_per_epoch Steps per epoch (default: min loader length)
---lr              Learning rate                                [default: 1e-4]
---eval_every      Evaluate every N epochs                      [default: 5]
---resume          Resume from existing checkpoint
---cpu             Force CPU (for debugging)
---save_dir        Directory to save checkpoints & results      [default: runs/]
+Training
+  --pretrain_epochs  Phase 1 epochs           [default: 30]
+  --epochs           Phase 2 epochs           [default: 100]
+  --steps_per_epoch  Steps per epoch          [default: min loader length]
+  --lr               Learning rate            [default: 1e-4]
+  --eval_every       Evaluate every N epochs  [default: 5]
+  --resume           Resume from checkpoint
+  --cpu              Force CPU (for debugging)
+  --save_dir         Checkpoint directory     [default: runs/]
 ```
 
 ---
 
-## Expected Results (from Table II)
+## Architecture (Fig. 3)
+
+```
+Input [B, 3, 224, 224]   (RGB, 224×224)
+│
+├── Shared Layers  (weights shared across all N source datasets)
+│   ├── Conv1  3×3, 16 ch, stride 4, Leaky ReLU
+│   ├── MaxPool 2×2, stride 1
+│   ├── Conv2  5×5, 32 ch, stride 2, Leaky ReLU
+│   ├── MaxPool 2×2, stride 1
+│   ├── Conv3  3×3, 64 ch, stride 1, Leaky ReLU
+│   ├── Conv4  3×3, 128 ch, stride 1, Leaky ReLU
+│   └── MaxPool 2×2, stride 1
+│
+└── Specific Layers × N  (one FC head per source dataset)
+    ├── FC1  → 1024, Leaky ReLU
+    ├── FC2  → 512,  Leaky ReLU
+    └── FC3  → 128   (L2-normalized output)
+```
+
+At inference on the target dataset, features from **all N heads are averaged** then L2-normalized — the paper's approach for producing the final feature.
+
+---
+
+## Expected Results (Table II, CASIA Multi-Spectral)
 
 | Sources | Target | Accuracy ↑ | EER ↓ |
 |---|---|---|---|
@@ -175,45 +223,6 @@ python train.py --root /path/to/CASIA-MS --sources 460 630 --target 700 --resume
 | 460, 700, WHT | 630 | 99.33% | 1.69% |
 | 460, WHT | 700 | 74.33% | 12.53% |
 | **Average** | — | **92.82%** | **4.07%** |
-
----
-
-## Architecture Details (Fig. 3)
-
-```
-Input [B, 1, 112, 112]
-│
-├── Shared Layers (all N datasets share these weights)
-│   ├── Conv1  3×3×16, stride 4, Leaky ReLU
-│   ├── MaxPool 2×2, stride 1
-│   ├── Conv2  5×5×32, stride 2, Leaky ReLU
-│   ├── MaxPool 2×2, stride 1
-│   ├── Conv3  3×3×64, stride 1, Leaky ReLU
-│   ├── Conv4  3×3×128, stride 1, Leaky ReLU
-│   └── MaxPool 2×2, stride 1
-│
-└── Specific Layers × N  (one per source dataset)
-    ├── FC1: → 1024, Leaky ReLU
-    ├── FC2: → 512,  Leaky ReLU
-    └── FC3: → 128   (L2 normalized output)
-```
-
-For inference on the target dataset, features from all N heads are **averaged** then L2-normalized.
-
----
-
-## Loss Function (Eq. 11)
-
-```
-L = L_ArcFace + L_MK-MMD + α·L_con + β·L_d-t
-```
-
-| Loss | Purpose | Default weight |
-|---|---|---|
-| L_ArcFace | Discriminative features per dataset | 1.0 |
-| L_MK-MMD | Reduce domain shift between source datasets | 1.0 |
-| L_con | Augmented features ≈ original features | α = 0.1 |
-| L_d-t | Triplet: intra-class sim, inter-class var | β = 1.0 |
 
 ---
 

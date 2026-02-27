@@ -106,21 +106,20 @@ def run_experiment(args, sources, target, run_id=""):
 
     # ── Data ──────────────────────────────────────────────────────────
     dm = CASIAMultiSpectral(
-        root=args.root,
-        source_spectra=sources,
-        target_spectrum=target,
-        subfolder_mode=args.subfolder_mode,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        seed=args.seed,
+        data_path       = args.root,
+        source_spectra  = sources,
+        target_spectrum = target,
+        batch_size      = args.batch_size,
+        num_workers     = args.num_workers,
+        seed            = args.seed,
     )
     dm.summary()
 
     # ── Model ─────────────────────────────────────────────────────────
     model = MultiDatasetExtractors(
-        n_datasets=len(sources),
-        input_size=112,
-        feature_dim=args.feature_dim,
+        n_datasets   = len(sources),
+        input_size   = 224,          # 224×224 RGB (matches your existing code)
+        feature_dim  = args.feature_dim,
     )
 
     # ── Loss ──────────────────────────────────────────────────────────
@@ -154,6 +153,7 @@ def run_experiment(args, sources, target, run_id=""):
         lam=args.lam,
         save_dir=str(save_dir),
         eval_every=args.eval_every,
+        pretrain_epochs=args.pretrain_epochs,
     )
 
     if args.resume and (save_dir / "best_model.pth").exists():
@@ -198,17 +198,18 @@ def parse_args():
     )
 
     # ── Paths ──────────────────────────────────────────────────────────
-    p.add_argument("--root",         required=True,       help="Root directory of CASIA-MS ROI data")
-    p.add_argument("--save_dir",     default="runs",      help="Directory to save checkpoints & results")
+    p.add_argument("--root",     default="/home/pai-ng/Jamal/CASIA-MS-ROI",
+                                 help="Flat folder containing all .jpg ROI files")
+    p.add_argument("--save_dir", default="runs", help="Directory for checkpoints & results")
 
     # ── Dataset ────────────────────────────────────────────────────────
-    p.add_argument("--sources",      nargs="+",           help="Source spectrum names (e.g. 460 630 700)")
-    p.add_argument("--target",       type=str,            help="Target spectrum name  (e.g. 850)")
+    p.add_argument("--sources", nargs="+", default=["460", "700", "630"],
+                   help="Source spectrum names (your train_domains)")
+    p.add_argument("--target",  type=str,  default="940",
+                   help="Target spectrum name  (your test_domains[0])")
     p.add_argument("--run_all",      action="store_true", help="Run all Table II experiments")
-    p.add_argument("--subfolder_mode", action="store_true",
-                   help="Images are in per-class subfolders (root/spectrum/class/img.jpg)")
     p.add_argument("--batch_size",   type=int, default=8,       help="Mini-batch size (8 per paper)")
-    p.add_argument("--num_workers",  type=int, default=4,       help="DataLoader workers")
+    p.add_argument("--num_workers",  type=int, default=2,       help="DataLoader workers")
     p.add_argument("--seed",         type=int, default=42,      help="Random seed")
 
     # ── Model ──────────────────────────────────────────────────────────
@@ -222,11 +223,12 @@ def parse_args():
     p.add_argument("--lam",          type=float, default=0.8,   help="Fourier augmentation λ")
 
     # ── Training ───────────────────────────────────────────────────────
-    p.add_argument("--epochs",           type=int,   default=100,  help="Training epochs")
+    p.add_argument("--pretrain_epochs",  type=int,   default=30,   help="Phase 1: supervised pre-training epochs (L_sup only)")
+    p.add_argument("--epochs",           type=int,   default=100,  help="Phase 2: full PDFG training epochs (all losses)")
     p.add_argument("--steps_per_epoch",  type=int,   default=None,
-                   help="Steps per epoch (default: min loader length)")
+                   help="Steps per epoch for both phases (default: min loader length)")
     p.add_argument("--lr",               type=float, default=1e-4, help="Learning rate")
-    p.add_argument("--eval_every",       type=int,   default=5,    help="Evaluate every N epochs")
+    p.add_argument("--eval_every",       type=int,   default=5,    help="Evaluate every N epochs (Phase 2 only)")
     p.add_argument("--resume",           action="store_true",       help="Resume from checkpoint")
     p.add_argument("--cpu",              action="store_true",       help="Force CPU (for debugging)")
 

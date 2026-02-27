@@ -35,10 +35,10 @@ from typing import List
 import torch
 from torch.utils.data import DataLoader
 
-from models.feature_extractor import MultiDatasetExtractors
-from losses.losses import PDFGLoss
-from data.fourier_augment import fourier_augment_batch
-from utils.metrics import evaluate
+from feature_extractor import MultiDatasetExtractors
+from losses import PDFGLoss
+from fourier_augment import fourier_augment_batch
+from metrics import evaluate
 
 
 # ─────────────────────────────────────────────────────────────────────────────

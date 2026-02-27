@@ -4,11 +4,11 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 import os
-import math
 import random
 from PIL import Image
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from pytorch_metric_learning import losses as pml_losses
 from tqdm import tqdm
 
 # ----------------------------
@@ -38,16 +38,17 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ----------------------------
 def fourier_augment_batch(batch1, batch2, lam=0.8):
     """
-    Mix amplitude spectra of batch1 (source) with batch2 (style donor).
-    Augmented images keep the identity of batch1 with the style of batch2.
+    Generate x^{D1->D2}: same identity as batch1, new style from batch2.
+    Phase (identity/semantics) kept from batch1.
+    Amplitude (style/illumination) interpolated toward batch2.
     """
     B, C, H, W = batch1.shape
     result = torch.zeros_like(batch1)
     b1, b2 = batch1.cpu().numpy(), batch2.cpu().numpy()
     for i in range(B):
         for c in range(C):
-            F1 = np.fft.fft2(b1[i, c])
-            F2 = np.fft.fft2(b2[i, c])
+            F1      = np.fft.fft2(b1[i, c])
+            F2      = np.fft.fft2(b2[i, c])
             A_mixed = (1 - lam) * np.abs(F1) + lam * np.abs(F2)
             F_new   = A_mixed * np.exp(1j * np.angle(F1))
             result[i, c] = torch.from_numpy(
@@ -86,12 +87,15 @@ class CASIASpectrum(Dataset):
         for hand_id, imgs in class_to_imgs.items():
             label = self.label_map[hand_id]
             rng   = random.Random(seed + label)
-            imgs  = list(imgs); rng.shuffle(imgs)
-            sp    = max(1, int(len(imgs) * 0.75))
+            imgs  = list(imgs)
+            rng.shuffle(imgs)
+            sp     = max(1, int(len(imgs) * 0.75))
             chosen = imgs[:sp] if split == "train" else imgs[sp:]
             self.samples.extend((p, label) for p in chosen)
 
-    def __len__(self):  return len(self.samples)
+    def __len__(self):
+        return len(self.samples)
+
     def __getitem__(self, idx):
         path, label = self.samples[idx]
         return self.to_tensor(Image.open(path).convert("RGB")), label
@@ -149,24 +153,10 @@ class MultiDatasetExtractors(nn.Module):
 # ----------------------------
 # 5. Losses
 # ----------------------------
-class ArcFaceHead(nn.Module):
-    """ArcFace: Additive Angular Margin Loss (L_sup, Eq. 1)."""
-    def __init__(self, in_features, num_classes, s=64.0, m=0.5):
-        super().__init__()
-        self.s, self.m   = s, m
-        self.weight      = nn.Parameter(torch.FloatTensor(num_classes, in_features))
-        nn.init.xavier_uniform_(self.weight)
-        self.cos_m = math.cos(m);  self.sin_m = math.sin(m)
-        self.th    = math.cos(math.pi - m)
-        self.mm    = math.sin(math.pi - m) * m
-
-    def forward(self, features, labels):
-        cosine = F.linear(features, F.normalize(self.weight))
-        sine   = torch.sqrt((1.0 - cosine.pow(2)).clamp(0, 1))
-        phi    = cosine * self.cos_m - sine * self.sin_m
-        phi    = torch.where(cosine > self.th, phi, cosine - self.mm)
-        one_hot = torch.zeros_like(cosine).scatter_(1, labels.view(-1, 1).long(), 1)
-        return F.cross_entropy((one_hot * phi + (1 - one_hot) * cosine) * self.s, labels)
+# We use pytorch_metric_learning ArcFaceLoss instead of a custom one.
+# The math is identical (additive angular margin, Eq. 1 in paper).
+# Key advantage: exposes get_logits() so we can compute train accuracy
+# from already-computed features with no extra forward pass.
 
 def mkmmd_loss(src, tgt, kernels=(1, 5, 10, 20, 50, 100)):
     """MK-MMD domain adaptation loss (L_ada, Eq. 8)."""
@@ -179,10 +169,14 @@ def mkmmd_loss(src, tgt, kernels=(1, 5, 10, 20, 50, 100)):
     return loss / len(kernels)
 
 def consistent_loss(orig_feat, aug_feats_per_pair):
-    """L_con: augmented features averaged over all heads should match original (Eq. 9)."""
+    """
+    L_con (Eq. 9): for each augmented pair x^{Dj->Dn}, pass through ALL N heads,
+    average the N features, then penalise distance from the original feature f(x^Dj)^j.
+    aug_feats_per_pair: list of (N-1) elements, each a list of N tensors [B, d].
+    """
     loss = 0.0
-    for head_feats in aug_feats_per_pair:           # head_feats: list of N tensors [B,d]
-        avg = torch.stack(head_feats, dim=0).mean(0)
+    for head_feats in aug_feats_per_pair:
+        avg   = torch.stack(head_feats, dim=0).mean(0)
         loss += F.mse_loss(orig_feat, avg)
     return loss / max(len(aug_feats_per_pair), 1)
 
@@ -195,12 +189,11 @@ def triplet_loss(anchor, positive, negative, margin=0.4):
 
 def sample_negative(aug_feats, aug_labels, anchor_labels):
     """Pick a different-class augmented feature for each anchor."""
-    B = anchor_labels.size(0)
+    B         = anchor_labels.size(0)
     negatives = torch.zeros_like(aug_feats[:B])
     for i in range(B):
-        mask = aug_labels != anchor_labels[i]
-        pool = mask.nonzero(as_tuple=False).squeeze(1)
-        negatives[i] = aug_feats[pool[torch.randint(len(pool), (1,))]] if len(pool) else aug_feats[random.randint(0, B-1)]
+        pool = (aug_labels != anchor_labels[i]).nonzero(as_tuple=False).squeeze(1)
+        negatives[i] = aug_feats[pool[torch.randint(len(pool), (1,))]] if len(pool) else aug_feats[random.randint(0, B - 1)]
     return negatives
 
 # ----------------------------
@@ -213,14 +206,14 @@ src_train = [CASIASpectrum(data_path, s, "train") for s in train_domains]
 src_test  = [CASIASpectrum(data_path, s, "test")  for s in train_domains]
 tgt_test  = CASIASpectrum(data_path, test_domains[0], "test")
 
-num_classes_per_src = [ds.label_map.__len__() for ds in src_train]
+num_classes_per_src = [len(ds.label_map) for ds in src_train]
 
-train_loaders = [DataLoader(ds, batch_size=batch_size, shuffle=True,  num_workers=2, pin_memory=True, drop_last=True)  for ds in src_train]
+train_loaders = [DataLoader(ds, batch_size=batch_size, shuffle=True,  num_workers=2, pin_memory=True, drop_last=True) for ds in src_train]
 reg_loader    =  DataLoader(ConcatDataset(src_test), batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-tgt_loader    =  DataLoader(tgt_test, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+tgt_loader    =  DataLoader(tgt_test,                batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
-# Infinite iterators so we can zip loaders of different lengths
 class _Inf:
+    """Wraps a DataLoader so it never raises StopIteration."""
     def __init__(self, loader): self.loader = loader; self._it = iter(loader)
     def next(self):
         try: return next(self._it)
@@ -231,11 +224,21 @@ inf_loaders = [_Inf(ld) for ld in train_loaders]
 # ----------------------------
 # 7. Model & Optimizer Setup
 # ----------------------------
-model      = MultiDatasetExtractors(N, feature_dim).to(device)
-arc_heads  = nn.ModuleList([ArcFaceHead(feature_dim, nc, arcface_s, arcface_m) for nc in num_classes_per_src]).to(device)
-optimizer  = optim.Adam(list(model.parameters()) + list(arc_heads.parameters()), lr=lr)
+model     = MultiDatasetExtractors(N, feature_dim).to(device)
+arc_heads = nn.ModuleList([
+    pml_losses.ArcFaceLoss(num_classes=nc, embedding_size=feature_dim, margin=arcface_m, scale=arcface_s).to(device)
+    for nc in num_classes_per_src
+])
+
+# all_params used for optimiser AND grad clipping — ArcFace weights must be included
+all_params = list(model.parameters()) + list(arc_heads.parameters())
+optimizer  = optim.Adam(all_params, lr=lr)
 
 steps_per_epoch = min(len(ld) for ld in train_loaders)
+
+print(f"  Classes per source : {num_classes_per_src}")
+print(f"  Steps per epoch    : {steps_per_epoch}")
+print(f"  Device             : {device}\n")
 
 # ----------------------------
 # 8. Evaluation
@@ -255,24 +258,23 @@ def evaluate():
     reg_f, reg_l = get_feats(reg_loader)
     tgt_f, tgt_l = get_feats(tgt_loader)
 
-    # Identification accuracy
     sim  = torch.mm(tgt_f, reg_f.t())
     pred = reg_l[sim.argmax(dim=1)]
     acc  = (pred == tgt_l).float().mean().item() * 100
 
-    # EER
     sim_mat = torch.mm(tgt_f, tgt_f.t()).numpy()
-    n = len(tgt_l)
     gen, imp = [], []
-    for i in range(n):
-        for j in range(i+1, n):
+    for i in range(len(tgt_l)):
+        for j in range(i + 1, len(tgt_l)):
             (gen if tgt_l[i] == tgt_l[j] else imp).append(sim_mat[i, j])
     gen, imp = np.array(gen), np.array(imp)
     thrs = np.linspace(min(gen.min(), imp.min()), max(gen.max(), imp.max()), 500)
-    eer  = min(((abs((imp >= t).mean() - (gen < t).mean()), ((imp >= t).mean() + (gen < t).mean()) / 2) for t in thrs), key=lambda x: x[0])[1] * 100
+    eer  = min(
+        ((abs((imp >= t).mean() - (gen < t).mean()), ((imp >= t).mean() + (gen < t).mean()) / 2) for t in thrs),
+        key=lambda x: x[0]
+    )[1] * 100
 
-    print(f"  Identification Acc : {acc:.2f}%")
-    print(f"  EER                : {eer:.2f}%")
+    print(f"  -> Test  | Acc: {acc:.2f}%  EER: {eer:.2f}%")
     return acc, eer
 
 # ----------------------------
@@ -280,54 +282,91 @@ def evaluate():
 # ----------------------------
 
 # ── Phase 1: Supervised pre-training (L_sup only) ──────────────────────────
-# Each head trained on its own dataset's original + Fourier-augmented images.
-print(f"\n{'='*55}")
+#
+# Paper (Section III-B): "The feature extractors are firstly trained by L_sup
+# using the labeled source images and augmented images."
+#
+# Augmented images x^{Di->Dj} (style of Dj, identity of Di) are fed through
+# head i with Di's labels. This is NOT a paradox — it is intentional:
+#   - Phase spectrum (identity info) is preserved from Di
+#   - Amplitude spectrum (style/illumination) is mixed toward Dj
+# Training head i on these forces it to be STYLE-INVARIANT: it must
+# recognise the same identity whether it looks like spectrum 460 or 700.
+# This is exactly the generalisation the paper is after.
+#
+print(f"{'='*55}")
 print(f"  Phase 1 — Supervised Pre-training  ({pretrain_epochs} epochs)")
+print(f"  (L_sup on original + Fourier-augmented images per head)")
 print(f"{'='*55}")
 
 for epoch in range(pretrain_epochs):
-    model.train(); arc_heads.train()
-    epoch_loss = 0.0
+    model.train()
+    for h in arc_heads: h.train()
+    epoch_loss  = 0.0
+    epoch_corr  = 0
+    epoch_total = 0
 
-    for _ in tqdm(range(steps_per_epoch), desc=f"Pretrain {epoch+1}/{pretrain_epochs}"):
+    for _ in tqdm(range(steps_per_epoch), desc=f"Pretrain {epoch+1}/{pretrain_epochs}", leave=False):
         batches = [(imgs.to(device), lbl.to(device)) for imgs, lbl in (il.next() for il in inf_loaders)]
         optimizer.zero_grad()
         loss = torch.tensor(0.0, device=device)
 
         for i, (src_imgs, src_lbl) in enumerate(batches):
-            # Original images through head i
-            loss += arc_heads[i](model.extract(src_imgs, i), src_lbl)
-            # Fourier-augmented x^{Di->Dj} through head i (same identity labels)
+            # Original source images → head i with Di's labels
+            feat  = model.extract(src_imgs, i)
+            loss += arc_heads[i](feat, src_lbl)
+
+            # Train accuracy from original images (no extra forward pass)
+            with torch.no_grad():
+                preds = arc_heads[i].get_logits(feat).argmax(dim=1)
+                epoch_corr  += (preds == src_lbl).sum().item()
+                epoch_total += src_lbl.size(0)
+
+            # Augmented x^{Di->Dj} → head i with SAME Di labels
+            # Head i must learn to be invariant to style changes
             for j in range(N):
                 if i == j: continue
                 sty, _ = batches[j]
                 if sty.size(0) != src_imgs.size(0):
                     sty = sty[torch.randint(sty.size(0), (src_imgs.size(0),))]
-                aug_imgs = fourier_augment_batch(src_imgs, sty, lam)
-                loss += arc_heads[i](model.extract(aug_imgs, i), src_lbl)
+                aug_feat = model.extract(fourier_augment_batch(src_imgs, sty, lam), i)
+                loss    += arc_heads[i](aug_feat, src_lbl)
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        torch.nn.utils.clip_grad_norm_(all_params, 5.0)   # clip ALL params incl. ArcFace weights
         optimizer.step()
         epoch_loss += loss.item()
 
-    print(f"  Epoch [{epoch+1}/{pretrain_epochs}] L_sup = {epoch_loss/steps_per_epoch:.4f}")
+    avg_loss = epoch_loss / steps_per_epoch
+    avg_acc  = 100.0 * epoch_corr / epoch_total if epoch_total > 0 else 0.0
+    print(f"  Epoch [{epoch+1}/{pretrain_epochs}] Loss: {avg_loss:.4f}  Train Acc: {avg_acc:.2f}%")
 
 # ── Phase 2: Full PDFG training (all losses, Eq. 11) ───────────────────────
+#
+# Paper (Section III-D, Eq. 9): for L_con, x^{Di->Dj} is fed into ALL N heads.
+# This is different from L_sup where it only goes through its source head.
+# The two usages of augmented images serve different purposes:
+#   L_sup  : augmented → own head    → style invariance per extractor
+#   L_con  : augmented → all heads   → cross-extractor feature consistency
+#
 print(f"\n{'='*55}")
-print(f"  Phase 2 — Full PDFG Training  ({epochs} epochs)")
+print(f"  Phase 2 — Full PDFG Training  ({epochs} epochs, Eq. 11)")
+print(f"  L = L_sup + L_ada + α·L_con + β·L_d-t")
 print(f"{'='*55}")
 
 best_eer = float("inf")
 
 for epoch in range(epochs):
-    model.train(); arc_heads.train()
-    log = {"total": 0., "sup": 0., "ada": 0., "con": 0., "dt": 0.}
+    model.train()
+    for h in arc_heads: h.train()
+    log         = {"total": 0., "sup": 0., "ada": 0., "con": 0., "dt": 0.}
+    epoch_corr  = 0
+    epoch_total = 0
 
-    for _ in tqdm(range(steps_per_epoch), desc=f"Train {epoch+1}/{epochs}"):
+    for _ in tqdm(range(steps_per_epoch), desc=f"Train {epoch+1}/{epochs}", leave=False):
         batches = [(imgs.to(device), lbl.to(device)) for imgs, lbl in (il.next() for il in inf_loaders)]
 
-        # Build all Fourier-augmented pairs (Di -> Dj)
+        # Build all Fourier-augmented pairs x^{Di->Dj} for i != j
         aug = {}
         for i in range(N):
             src_imgs, src_lbl = batches[i]
@@ -341,59 +380,71 @@ for epoch in range(epochs):
         optimizer.zero_grad()
         loss = torch.tensor(0.0, device=device)
 
-        # L_sup: original + augmented images through their own head
+        # L_sup: original images → own head; augmented x^{Di->Dj} → head i (same labels)
         orig_feats = []
         for i, (src_imgs, src_lbl) in enumerate(batches):
-            feat = model.extract(src_imgs, i)
+            feat  = model.extract(src_imgs, i)
             l_sup = arc_heads[i](feat, src_lbl)
             orig_feats.append(feat)
-            loss += l_sup; log["sup"] += l_sup.item()
+            loss += l_sup
+            log["sup"] += l_sup.item()
+
+            with torch.no_grad():
+                preds = arc_heads[i].get_logits(feat).argmax(dim=1)
+                epoch_corr  += (preds == src_lbl).sum().item()
+                epoch_total += src_lbl.size(0)
 
             for j in range(N):
                 if i == j: continue
                 aug_imgs, aug_lbl = aug[(i, j)]
-                l_sup_aug = arc_heads[i](model.extract(aug_imgs, i), aug_lbl) / (N - 1)
-                loss += l_sup_aug; log["sup"] += l_sup_aug.item()
+                l_sup_aug  = arc_heads[i](model.extract(aug_imgs, i), aug_lbl)
+                loss      += l_sup_aug
+                log["sup"] += l_sup_aug.item()
 
-        # L_con + L_d-t: per source dataset
+        # L_con + L_d-t: augmented x^{Di->Dj} → ALL N heads (Eq. 9)
         for i in range(N):
             aug_head_feats, aug_labels_list = [], []
             for j in range(N):
                 if i == j: continue
                 aug_imgs, aug_lbl = aug[(i, j)]
-                aug_head_feats.append(model.extract_all(aug_imgs))   # list of N [B,d]
+                aug_head_feats.append(model.extract_all(aug_imgs))  # list of N [B,d]
                 aug_labels_list.append(aug_lbl)
 
-            l_con = consistent_loss(orig_feats[i], aug_head_feats)
-            loss += l_con; log["con"] += l_con.item()
+            l_con  = alpha * consistent_loss(orig_feats[i], aug_head_feats)
+            loss  += l_con
+            log["con"] += l_con.item()
 
             aug_avg = torch.stack([torch.stack(hf, 0).mean(0) for hf in aug_head_feats], 0).mean(0)
             neg     = sample_negative(aug_avg, aug_labels_list[0], batches[i][1])
-            l_dt    = triplet_loss(orig_feats[i], torch.roll(orig_feats[i], 1, 0), neg, triplet_margin)
-            loss += l_dt; log["dt"] += l_dt.item()
+            l_dt    = beta * triplet_loss(orig_feats[i], torch.roll(orig_feats[i], 1, 0), neg, triplet_margin)
+            loss   += l_dt
+            log["dt"] += l_dt.item()
 
-        # L_ada: MK-MMD between every source pair
-        ada_count = 0
+        # L_ada: MK-MMD between every pair of source datasets
         for i in range(N):
-            for j in range(i+1, N):
+            for j in range(i + 1, N):
                 l_ada = mkmmd_loss(orig_feats[i], orig_feats[j])
-                loss += l_ada; log["ada"] += l_ada.item(); ada_count += 1
-        if ada_count: log["ada"] /= ada_count
+                loss += l_ada
+                log["ada"] += l_ada.item()
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        torch.nn.utils.clip_grad_norm_(all_params, 5.0)
         optimizer.step()
         log["total"] += loss.item()
 
     for k in log: log[k] /= steps_per_epoch
-    print(f"  Epoch [{epoch+1}/{epochs}] total={log['total']:.4f} | sup={log['sup']:.4f} | ada={log['ada']:.4f} | con={log['con']:.4f} | dt={log['dt']:.4f}")
+    avg_acc = 100.0 * epoch_corr / epoch_total if epoch_total > 0 else 0.0
+    print(
+        f"  Epoch [{epoch+1}/{epochs}] "
+        f"Loss: {log['total']:.4f}  Train Acc: {avg_acc:.2f}%  |  "
+        f"sup={log['sup']:.4f}  ada={log['ada']:.4f}  con={log['con']:.4f}  dt={log['dt']:.4f}"
+    )
 
     if (epoch + 1) % eval_every == 0:
-        print(f"\n  -- Evaluation at epoch {epoch+1} --")
         acc, eer = evaluate()
         if eer < best_eer:
             best_eer = eer
-            torch.save({"model": model.state_dict(), "heads": arc_heads.state_dict()}, "best_model.pth")
+            torch.save({"model": model.state_dict(), "heads": [h.state_dict() for h in arc_heads]}, "best_model.pth")
             print(f"  New best EER: {eer:.2f}% -> saved best_model.pth")
         print()
 

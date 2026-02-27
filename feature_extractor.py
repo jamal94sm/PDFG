@@ -15,8 +15,8 @@ class SharedLayers(nn.Module):
 
     def __init__(self):
         super().__init__()
-        # Conv1: 3×3×16, stride 4, Leaky ReLU
-        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, stride=4, padding=1)
+        # Conv1: 3×3×16, stride 4, Leaky ReLU  (3 channels for RGB)
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=4, padding=1)
         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=1)
 
         # Conv2: 5×5×32, stride 2, Leaky ReLU
@@ -67,12 +67,12 @@ class FeatureExtractor(nn.Module):
     Combines shared layers + dataset-specific layers.
     """
 
-    def __init__(self, input_size: int = 112, feature_dim: int = 128):
+    def __init__(self, input_size: int = 224, feature_dim: int = 128):
         super().__init__()
         self.shared = SharedLayers()
         # Compute flattened size after shared layers
         with torch.no_grad():
-            dummy = torch.zeros(1, 1, input_size, input_size)
+            dummy = torch.zeros(1, 3, input_size, input_size)
             out = self.shared(dummy)
             flat_dim = out.view(1, -1).shape[1]
         self.specific = SpecificLayers(flat_dim, feature_dim)
@@ -96,7 +96,7 @@ class MultiDatasetExtractors(nn.Module):
         feature_dim: Output feature dimensionality (128 by default)
     """
 
-    def __init__(self, n_datasets: int, input_size: int = 112, feature_dim: int = 128):
+    def __init__(self, n_datasets: int, input_size: int = 224, feature_dim: int = 128):
         super().__init__()
         self.n_datasets = n_datasets
 
@@ -105,7 +105,7 @@ class MultiDatasetExtractors(nn.Module):
 
         # Compute flattened dimension once
         with torch.no_grad():
-            dummy = torch.zeros(1, 1, input_size, input_size)
+            dummy = torch.zeros(1, 3, input_size, input_size)
             out = self.shared(dummy)
             flat_dim = out.view(1, -1).shape[1]
 

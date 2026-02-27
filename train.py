@@ -36,7 +36,7 @@ import torch
 
 from dataset import CASIAMultiSpectral, CASIA_SPECTRA
 from feature_extractor import MultiDatasetExtractors
-from losses.losses import PDFGLoss
+from losses import PDFGLoss
 from trainer import PDFGTrainer
 
 

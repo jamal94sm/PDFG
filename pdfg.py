@@ -34,27 +34,32 @@ eval_every      = 5
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ----------------------------
-# 2. Fourier Augmentation
+# 2. Fourier Augmentation (EDITED for GPU speed)
 # ----------------------------
 def fourier_augment_batch(batch1, batch2, lam=0.8):
     """
     Generate x^{D1->D2}: same identity as batch1, new style from batch2.
-    Phase (identity/semantics) kept from batch1.
-    Amplitude (style/illumination) interpolated toward batch2.
+    Fully vectorized in PyTorch for GPU acceleration.
     """
-    B, C, H, W = batch1.shape
-    result = torch.zeros_like(batch1)
-    b1, b2 = batch1.cpu().numpy(), batch2.cpu().numpy()
-    for i in range(B):
-        for c in range(C):
-            F1      = np.fft.fft2(b1[i, c])
-            F2      = np.fft.fft2(b2[i, c])
-            A_mixed = (1 - lam) * np.abs(F1) + lam * np.abs(F2)
-            F_new   = A_mixed * np.exp(1j * np.angle(F1))
-            result[i, c] = torch.from_numpy(
-                np.clip(np.real(np.fft.ifft2(F_new)), 0, 1).astype(np.float32)
-            )
-    return result.to(batch1.device)
+    # Perform 2D FFT on the last two dimensions (H, W)
+    fft1 = torch.fft.fft2(batch1, dim=(-2, -1))
+    fft2 = torch.fft.fft2(batch2, dim=(-2, -1))
+    
+    # Extract amplitude and phase
+    amp1, phase1 = torch.abs(fft1), torch.angle(fft1)
+    amp2 = torch.abs(fft2)
+    
+    # Interpolate amplitude (style) and keep original phase (identity)
+    amp_mixed = (1 - lam) * amp1 + lam * amp2
+    
+    # Reconstruct the complex tensor
+    fft_new = amp_mixed * torch.exp(1j * phase1)
+    
+    # Inverse FFT to get back to the spatial domain
+    result = torch.real(torch.fft.ifft2(fft_new, dim=(-2, -1)))
+    
+    # Clamp to valid image range
+    return torch.clamp(result, 0.0, 1.0)
 
 # ----------------------------
 # 3. Dataset

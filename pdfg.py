@@ -158,27 +158,67 @@ class MultiDatasetExtractors(nn.Module):
 # ----------------------------
 # 5. Losses
 # ----------------------------
-def mkmmd_loss(src, tgt, kernels=(1, 5, 10, 20, 50, 100)):
-    """MK-MMD domain adaptation loss (L_ada, Eq. 8)."""
+def mkmmd_loss(f1, f2, kernels=(1, 5, 10, 20, 50, 100)):
+    """
+    MK-MMD domain adaptation loss (L_ada, Eq. 8) applied on EXTRACTED FEATURES.
+
+    f1, f2 : feature tensors [B, d] — L2-normalised embeddings from orig_feats.
+
+    RBF kernel: k(x, x') = exp(-||x - x'||^2 / bw)
+
+    Computed as:
+        MMD^2 = (1/A^2) sum_a sum_a' k(f1_a, f1_a')
+              - (2/AB)  sum_a sum_b   k(f1_a, f2_b)
+              + (1/B^2) sum_b sum_b'  k(f2_b, f2_b')
+
+    Squared distances are computed directly via the identity:
+        ||x - y||^2 = ||x||^2 + ||y||^2 - 2<x, y>
+    This avoids the sqrt+pow(2) redundancy of torch.cdist and is numerically
+    safer with .clamp(min=0) to prevent tiny negatives from floating point.
+
+    Final loss averages over all kernel bandwidths (MK-MMD).
+    """
+    def sq_dists(a, b):
+        # ||a_i - b_j||^2 for all pairs -> [A, B]
+        aa = (a * a).sum(dim=1, keepdim=True)   # [A, 1]
+        bb = (b * b).sum(dim=1, keepdim=True)   # [B, 1]
+        ab = torch.mm(a, b.t())                  # [A, B]
+        return (aa + bb.t() - 2 * ab).clamp(min=0)
+
+    d_ss = sq_dists(f1, f1)   # [A, A]
+    d_st = sq_dists(f1, f2)   # [A, B]
+    d_tt = sq_dists(f2, f2)   # [B, B]
+
     loss = 0.0
     for bw in kernels:
-        k_ss = torch.exp(-torch.cdist(src, src).pow(2) / bw).mean()
-        k_st = torch.exp(-torch.cdist(src, tgt).pow(2) / bw).mean()
-        k_tt = torch.exp(-torch.cdist(tgt, tgt).pow(2) / bw).mean()
+        k_ss = torch.exp(-d_ss / bw).mean()
+        k_st = torch.exp(-d_st / bw).mean()
+        k_tt = torch.exp(-d_tt / bw).mean()
         loss += k_ss - 2 * k_st + k_tt
     return loss / len(kernels)
 
 def consistent_loss(orig_feat, aug_feats_per_pair):
     """
-    L_con (Eq. 9): for each augmented pair x^{Dj->Dn}, pass through ALL N heads,
-    average the N features, then penalise distance from the original feature f(x^Dj)^j.
+    L_con (Eq. 9):
+        L_con = SUM_{n!=j} || f(x^Dj)^j  -  (1/N) SUM_{l=1}^{N} f(x^{Dj->Dn})^l ||^2
+
+    - Outer operation : SUM over n!=j  (N-1 terms) — NOT averaged, summed.
+    - Inner distance  : squared L2 norm ||a - b||^2 = SUM_k (a_k - b_k)^2
+                        NOT MSE which would divide by feature dim d.
+    - Aug average     : (1/N) over all N heads for each augmented image x^{Dj->Dn}.
+
     aug_feats_per_pair: list of (N-1) elements, each a list of N tensors [B, d].
+    orig_feat        : [B, d] — f(x^Dj)^j, original image through its own head j.
     """
-    loss = 0.0
+    loss = torch.tensor(0.0, device=orig_feat.device)
     for head_feats in aug_feats_per_pair:
-        avg   = torch.stack(head_feats, dim=0).mean(0)
-        loss += F.mse_loss(orig_feat, avg)
-    return loss / max(len(aug_feats_per_pair), 1)
+        # (1/N) Σ_{l=1}^{N} f(x^{Dj->Dn})^l  →  [B, d]
+        avg      = torch.stack(head_feats, dim=0).mean(0)
+        # || f(x^Dj)^j - avg ||^2  per sample, summed over feature dim, averaged over batch
+        sq_l2    = ((orig_feat - avg) ** 2).sum(dim=1)   # [B]
+        loss    += sq_l2.mean()                           # scalar, averaged over batch
+    # Outer SUM over n!=j (no division — paper uses Σ not mean)
+    return loss
 
 def triplet_loss_fn(anchor, positive, negative, margin=0.4):
     """L_d-t: dataset-aware triplet loss (Eq. 10)."""
@@ -517,6 +557,10 @@ for epoch in range(epochs):
             log["dt"]  += l_dt.item()
 
         # ── L_ada: MK-MMD between every source domain pair ───────────────
+        # Applied on EXTRACTED FEATURES (orig_feats[i], orig_feats[j]).
+        # Aligns the learned feature distributions of different source domains
+        # so the shared layers generalise to the unseen test domain.
+        # Squared distances computed directly (no sqrt+pow redundancy, clamped).
         for i in range(N):
             for j in range(i + 1, N):
                 l_ada       = mkmmd_loss(orig_feats[i], orig_feats[j])

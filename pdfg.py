@@ -280,14 +280,15 @@ tgt_test  = CASIASpectrum(data_path, test_domains)
 # Per-domain infinite loaders for training
 train_loaders = [
     DataLoader(ds, batch_size=batch_size, shuffle=True,
-               num_workers=2, pin_memory=True, drop_last=True)
+               num_workers=0, pin_memory=False, drop_last=True,
+               persistent_workers=False)
     for ds in src_train
 ]
 
 # Single loader used for every evaluation call
 test_loader = DataLoader(
     tgt_test, batch_size=batch_size, shuffle=False,
-    num_workers=2, pin_memory=True,
+    num_workers=0, pin_memory=False,
 )
 
 num_classes_per_src = [len(ds.label_map) for ds in src_train]

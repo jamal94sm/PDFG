@@ -16,11 +16,11 @@ from tqdm import tqdm
 # ----------------------------
 data_path     = "/home/pai-ng/Jamal/CASIA-MS-ROI"
 train_domains = ["460", "WHT"]
-test_domains  = ["700"]
+test_domains  = ["850"]
 
 batch_size      = 8
 lr              = 1e-4
-epochs          = 100
+epochs          = 200
 pretrain_epochs = 20
 arcface_s       = 64.0
 arcface_m       = 0.5

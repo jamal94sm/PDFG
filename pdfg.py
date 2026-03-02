@@ -69,7 +69,7 @@ class CASIASpectrum(Dataset):
     """
     def __init__(self, data_path, spectra):
         self.to_tensor = transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize((112, 112)),
             transforms.ToTensor(),
         ])
         spectra_set   = set(spectra)

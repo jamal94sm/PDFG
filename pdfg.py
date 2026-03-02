@@ -130,7 +130,8 @@ class SharedLayers(nn.Module):
 class MultiDatasetExtractors(nn.Module):
     """
     N feature extractors sharing the CNN backbone, each with its own FC head.
-    At inference, features from all N heads are averaged (paper Section III).
+    At inference, features from all N heads are averaged then L2-normalised
+    (paper Section III-B and Section IV-B).
     """
     def __init__(self, n_datasets, feature_dim=128):
         super().__init__()
@@ -155,6 +156,17 @@ class MultiDatasetExtractors(nn.Module):
         """Extract features from all N heads, each L2-normalised."""
         shared = self.shared(x).view(x.size(0), -1)
         return [F.normalize(h(shared), p=2, dim=1) for h in self.heads]
+
+    def extract_avg(self, x):
+        """
+        Paper evaluation protocol (Section IV-B):
+            'features extracted by different feature extractors are averaged
+             as the final feature and normalised by l2 normalisation.'
+        Returns a single L2-normalised feature vector per image.
+        """
+        per_head = torch.stack(self.extract_all(x), dim=0)   # [N, B, d]
+        avg      = per_head.mean(dim=0)                       # [B, d]
+        return F.normalize(avg, p=2, dim=1)                   # [B, d]  ← final feature
 
 # ----------------------------
 # 5. Losses
@@ -248,11 +260,6 @@ N = len(train_domains)
 print("Building datasets...")
 
 # ── Shared label map built from TRAIN domains ────────────────────────────────
-# Train and test sets share the same identities, so scanning train domains
-# is sufficient to build the full label map.
-# All datasets (train + test) receive this shared map so that integer label k
-# refers to the same hand_id everywhere — essential for ArcFace head accuracy:
-# source head argmax predictions directly correspond to test label integers.
 all_hand_ids = set()
 for fname in sorted(os.listdir(data_path)):
     if not fname.lower().endswith(".jpg"):
@@ -261,50 +268,35 @@ for fname in sorted(os.listdir(data_path)):
     if len(parts) != 4:
         continue
     subject_id, hand, spec, _ = parts
-    if spec in set(train_domains):       # only scan train domains
+    if spec in set(train_domains):
         all_hand_ids.add(f"{subject_id}_{hand}")
 shared_label_map  = {h: i for i, h in enumerate(sorted(all_hand_ids))}
 num_total_classes = len(shared_label_map)
-print(f"  Shared identity space: {num_total_classes} identities (same in train & test)")
+print(f"  Shared identity space: {num_total_classes} identities")
 
-src_train = [CASIASpectrum(data_path, [s], shared_label_map) for s in train_domains]
-tgt_test  = CASIASpectrum(data_path, test_domains, shared_label_map)
+# ── Source datasets → registration set (gallery) ─────────────────────────────
+# Paper: "The source datasets are used as the registration set"
+src_datasets = [CASIASpectrum(data_path, [s], shared_label_map) for s in train_domains]
+
+# ── Target dataset → query set ───────────────────────────────────────────────
+# Paper: "the target dataset is used as the query set"
+tgt_dataset  = CASIASpectrum(data_path, test_domains, shared_label_map)
 
 train_loaders = [
     DataLoader(ds, batch_size=batch_size, shuffle=True,
                num_workers=0, pin_memory=False, drop_last=True)
-    for ds in src_train
+    for ds in src_datasets
 ]
-test_loader = DataLoader(tgt_test, batch_size=batch_size, shuffle=False,
-                         num_workers=0, pin_memory=False)
 
-# ── Split test set: gallery (1st image per identity) + query (rest) ──────────
-_tf = transforms.Compose([transforms.Resize((112, 112)), transforms.ToTensor()])
+# Registration loader: all source domain images as gallery
+# (combine all source domains into one loader for evaluation)
+registration_dataset = torch.utils.data.ConcatDataset(src_datasets)
+registration_loader  = DataLoader(registration_dataset, batch_size=batch_size,
+                                  shuffle=False, num_workers=0, pin_memory=False)
 
-class _ListDataset(Dataset):
-    def __init__(self, samples, transform):
-        self.samples, self.transform = samples, transform
-    def __len__(self):
-        return len(self.samples)
-    def __getitem__(self, idx):
-        path, label = self.samples[idx]
-        return self.transform(Image.open(path).convert("RGB")), label
-
-gallery_samples, query_samples = [], []
-_seen = set()
-for path, label in tgt_test.samples:
-    if label not in _seen:
-        _seen.add(label)
-        gallery_samples.append((path, label))
-    else:
-        query_samples.append((path, label))
-
-gallery_loader = DataLoader(_ListDataset(gallery_samples, _tf),
-                            batch_size=batch_size, shuffle=False,
-                            num_workers=0, pin_memory=False)
-query_loader   = DataLoader(_ListDataset(query_samples, _tf),
-                            batch_size=batch_size, shuffle=False,
-                            num_workers=0, pin_memory=False)
+# Query loader: all target domain images
+query_loader = DataLoader(tgt_dataset, batch_size=batch_size,
+                          shuffle=False, num_workers=0, pin_memory=False)
 
 steps_per_epoch = min(len(ld) for ld in train_loaders)
 
@@ -321,21 +313,16 @@ class _Inf:
 
 inf_loaders = [_Inf(ld) for ld in train_loaders]
 
-print(f"  Train domains     : {train_domains}  (N={N} heads)")
-print(f"  Test  domain      : {test_domains[0]}")
-print(f"  Train samples     : {[len(ds) for ds in src_train]}")
-print(f"  Test  samples     : {len(tgt_test)}  "
-      f"(gallery={len(gallery_samples)}, query={len(query_samples)})")
-print(f"  Steps per epoch   : {steps_per_epoch}")
-print(f"  Device            : {device}\n")
+print(f"  Source (registration): {train_domains}  —  {len(registration_dataset)} images")
+print(f"  Target (query)        : {test_domains[0]}  —  {len(tgt_dataset)} images")
+print(f"  Steps per epoch       : {steps_per_epoch}")
+print(f"  Device                : {device}\n")
 
 # ----------------------------
 # 8. Model & Optimizer Setup
 # ----------------------------
 model = MultiDatasetExtractors(N, feature_dim).to(device)
 
-# ArcFace heads use num_total_classes (shared space) so argmax predictions
-# are directly comparable to test set label integers.
 arc_heads = nn.ModuleList([
     pml_losses.ArcFaceLoss(
         num_classes=num_total_classes, embedding_size=feature_dim,
@@ -351,15 +338,26 @@ optimizer  = optim.Adam(all_params, lr=lr)
 # 9. Evaluation
 # ----------------------------
 @torch.no_grad()
-def _extract(loader):
-    """Extract averaged-head L2-normalised features for a loader."""
+def _extract_avg(loader):
+    """
+    Extract the averaged, L2-normalised feature for every image in `loader`.
+
+    Paper (Section IV-B):
+        'For each target image, the features extracted by different feature
+         extractors are averaged as the final feature and normalised by l2
+         normalisation.'
+
+    The same averaging+normalisation is applied to registration (source)
+    images so that both gallery and query live in the same feature space.
+    """
     feats, labels = [], []
     for imgs, lbl in loader:
         imgs = imgs.to(device)
-        fs   = torch.stack(model.extract_all(imgs), dim=0).mean(0)
-        feats.append(F.normalize(fs, p=2, dim=1).cpu())
+        f    = model.extract_avg(imgs)   # [B, d]  averaged + L2-normalised
+        feats.append(f.cpu())
         labels.append(lbl)
-    return torch.cat(feats), torch.cat(labels)
+    return torch.cat(feats), torch.cat(labels)   # [M, d], [M]
+
 
 @torch.no_grad()
 def evaluate():
@@ -367,118 +365,57 @@ def evaluate():
     for h in arc_heads:
         h.eval()
 
-    # ── 1. Full similarity-based accuracy ───────────────────────────────────
-    # All M test images serve as both gallery and query.
-    # Cosine similarity matrix [M, M]; diagonal set to -1 to exclude self-match.
-    # Rank-1: each image's nearest neighbour (excluding itself) is its prediction.
-    # EER: all unique pairs (i<j) split into genuine / impostor by label equality.
-    all_feats, all_labels = _extract(test_loader)
-    M   = len(all_labels)
-    sim = torch.mm(all_feats, all_feats.t())   # [M, M] cosine similarity
-    sim.fill_diagonal_(-1.0)                   # exclude self-match
+    # ── Extract features ─────────────────────────────────────────────────────
+    # Registration set  = all source-domain images  (paper: "registration set")
+    # Query set         = all target-domain images  (paper: "query set")
+    reg_feats,  reg_labels  = _extract_avg(registration_loader)   # [G, d]
+    qry_feats,  qry_labels  = _extract_avg(query_loader)          # [Q, d]
 
-    pred_full = all_labels[sim.argmax(dim=1)]
-    acc_full  = (pred_full == all_labels).float().mean().item() * 100
+    G = len(reg_labels)
+    Q = len(qry_labels)
 
-    sim_np = sim.numpy()
-    gen_full, imp_full = [], []
-    for i in range(M):
-        for j in range(i + 1, M):          # upper triangle only (unique pairs)
-            s = sim_np[i, j]
-            (gen_full if all_labels[i] == all_labels[j] else imp_full).append(s)
-    eer_full = compute_eer(gen_full, imp_full)
-
-    # ── 2. Split similarity-based accuracy ──────────────────────────────────
-    # Gallery: first image per identity (registered template).
-    # Query  : all remaining images (probe set).
-    # Similarity matrix [Q, G]; no diagonal issue — sets are disjoint.
-    # Rank-1: each query matched to nearest gallery sample.
-    # EER: all (query_i, gallery_j) pairs split by label equality.
-    if len(query_samples) > 0:
-        gal_feats, gal_labels = _extract(gallery_loader)   # [G, d]
-        qry_feats, qry_labels = _extract(query_loader)     # [Q, d]
-
-        sim_split = torch.mm(qry_feats, gal_feats.t())     # [Q, G]
-        pred_split = gal_labels[sim_split.argmax(dim=1)]
-        acc_split  = (pred_split == qry_labels).float().mean().item() * 100
-
-        sim_split_np = sim_split.numpy()
-        gen_split, imp_split = [], []
-        for i in range(len(qry_labels)):
-            for j in range(len(gal_labels)):
-                s = sim_split_np[i, j]
-                (gen_split if qry_labels[i] == gal_labels[j] else imp_split).append(s)
-        eer_split = compute_eer(gen_split, imp_split)
-    else:
-        acc_split = eer_split = float("nan")
-
-    # ── 3. ArcFace head classification accuracy ─────────────────────────────
-    # Each ArcFace head has a weight matrix W: [num_total_classes, feature_dim].
-    # The rows of W are learned class prototype vectors.
-    # Classification score for class c = cosine_sim(feature, W[c])
-    #                                  = feature @ W[c] / (||feature|| ||W[c]||)
-    # Since extract() L2-normalises features, and we L2-normalise W rows,
-    # this reduces to: logits = feature @ W.t()  (pure dot product on unit sphere).
-    # argmax over classes → predicted identity integer.
-    # Because all datasets share the same label map, predicted integer directly
-    # matches test label integer — no remapping needed.
+    # ── Palmprint Identification (Rank-1 Accuracy) ───────────────────────────
+    # Paper: "the image in query set is matched with the images in registration
+    #         set to find the closest one. If they are belonging to the same
+    #         subject, the matching is successful and the accuracy is calculated
+    #         as the metric."
     #
-    # Per-head accuracy: uses that head's feature extractor + that head's W.
-    # Ensemble accuracy: average logits across all N heads before argmax.
+    # Cosine similarity matrix: sim[q, g] = <qry_feats[q], reg_feats[g]>
+    # Both feature sets are already L2-normalised → dot product = cosine sim.
+    # For each query, find the gallery image with the highest cosine similarity.
+    # No self-match issue: query set (target domain) ≠ registration set (source domain).
+    sim = torch.mm(qry_feats, reg_feats.t())          # [Q, G]
+    nn_idx   = sim.argmax(dim=1)                       # [Q] index into gallery
+    pred_ids = reg_labels[nn_idx]                      # [Q] predicted identity
+    acc      = (pred_ids == qry_labels).float().mean().item() * 100
 
-    # Accumulate per-head logits over the full test set
-    per_head_logits = [[] for _ in range(N)]
-    all_test_labels = []
+    # ── Palmprint Verification (EER) ─────────────────────────────────────────
+    # Paper: "the images of target dataset are matched with each other.
+    #         The genuine matching from the same category and the imposter
+    #         matching from the different categories are obtained.
+    #         Then, Equal Error Rate (EER) is obtained as the metric."
+    #
+    # All (query_i, gallery_j) pairs are scored; genuine if same label.
+    sim_np = sim.numpy()
+    gen_scores, imp_scores = [], []
+    for i in range(Q):
+        for j in range(G):
+            s = sim_np[i, j]
+            if qry_labels[i] == reg_labels[j]:
+                gen_scores.append(s)
+            else:
+                imp_scores.append(s)
+    eer = compute_eer(gen_scores, imp_scores)
 
-    for imgs, lbl in test_loader:
-        imgs        = imgs.to(device)
-        shared_feat = model.shared(imgs).view(imgs.size(0), -1)
-        all_test_labels.append(lbl)
-        for hi in range(N):
-            feat = F.normalize(model.heads[hi](shared_feat), p=2, dim=1)  # [B, d]
-            # L2-normalise W rows: W has shape [num_total_classes, feature_dim]
-            W_norm = F.normalize(arc_heads[hi].W, p=2, dim=0).t()         # [num_total_classes, d]
-            logits = feat @ W_norm.t()                                     # [B, num_total_classes]
-            per_head_logits[hi].append(logits.cpu())
-
-    all_test_labels = torch.cat(all_test_labels)   # [M]
-    head_accs = []
-    stacked_logits = []
-
-    for hi in range(N):
-        logits_hi = torch.cat(per_head_logits[hi], dim=0)   # [M, num_total_classes]
-        stacked_logits.append(logits_hi)
-        pred_hi  = logits_hi.argmax(dim=1)
-        acc_hi   = (pred_hi == all_test_labels).float().mean().item() * 100
-        head_accs.append(acc_hi)
-
-    # Ensemble: average logits across all N heads, then argmax
-    ens_logits  = torch.stack(stacked_logits, dim=0).mean(0)   # [M, num_total_classes]
-    acc_arc_ens = (ens_logits.argmax(dim=1) == all_test_labels).float().mean().item() * 100
-
-    # ── Print results ────────────────────────────────────────────────────────
-    print(f"\n  ┌─ Evaluation on test domain '{test_domains[0]}' │ M={M} images")
-    print(f"  │")
-    print(f"  │  [1] Full similarity  "
-          f"│ Rank-1: {acc_full:6.2f}%  EER: {eer_full:5.2f}%"
-          f"  — all {M} images as gallery+query, self excluded")
-    if not np.isnan(acc_split):
-        print(f"  │  [2] Split similarity "
-              f"│ Rank-1: {acc_split:6.2f}%  EER: {eer_split:5.2f}%"
-              f"  — gallery={len(gallery_samples)}, query={len(query_samples)}")
-    else:
-        print(f"  │  [2] Split similarity │ N/A — each identity has only 1 image")
-    print(f"  │")
-    for hi, acc_hi in enumerate(head_accs):
-        print(f"  │  [3] ArcFace head {hi}   "
-              f"│ Acc: {acc_hi:6.2f}%"
-              f"  — domain '{train_domains[hi]}' head, {num_total_classes} classes")
-    print(f"  │  [3] ArcFace ensemble "
-          f"│ Acc: {acc_arc_ens:6.2f}%"
-          f"  — averaged logits over {N} heads")
+    # ── Print ─────────────────────────────────────────────────────────────────
+    print(f"\n  ┌─ Evaluation │ registration={train_domains} ({G} imgs) "
+          f"│ query={test_domains[0]} ({Q} imgs)")
+    print(f"  │  Feature  : averaged {N} heads → L2-normalised  (dim={feature_dim})")
+    print(f"  │  Rank-1 Accuracy : {acc:6.2f}%")
+    print(f"  │  EER             : {eer:5.2f}%")
     print(f"  └{'─'*65}\n")
 
-    return acc_full, eer_full
+    return acc, eer
 
 # ----------------------------
 # 10. Training
@@ -642,9 +579,9 @@ for epoch in range(epochs):
     )
 
     if (epoch + 1) % eval_every == 0:
-        acc_full, eer_full = evaluate()
-        if not np.isnan(eer_full) and eer_full < best_eer:
-            best_eer = eer_full
+        acc, eer = evaluate()
+        if not np.isnan(eer) and eer < best_eer:
+            best_eer = eer
             torch.save(
                 {
                     "model"    : model.state_dict(),
@@ -653,7 +590,7 @@ for epoch in range(epochs):
                 },
                 "best_model.pth",
             )
-            print(f"  ✓ New best EER: {eer_full:.2f}%  -> saved best_model.pth")
+            print(f"  ✓ New best EER: {eer:.2f}%  -> saved best_model.pth")
         print()
 
 print(f"\nDone. Best EER: {best_eer:.2f}%")

@@ -20,7 +20,7 @@ test_domains  = ["700"]
 
 batch_size      = 8
 lr              = 1e-4
-epochs          = 200
+epochs          = 100
 pretrain_epochs = 20
 arcface_s       = 64.0
 arcface_m       = 0.5

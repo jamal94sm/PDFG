@@ -7,7 +7,7 @@ import os
 import random
 from PIL import Image
 from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader
 from pytorch_metric_learning import losses as pml_losses
 from tqdm import tqdm
 
@@ -60,14 +60,14 @@ class CASIASpectrum(Dataset):
     """
     Loads ALL images belonging to the given list of spectra (domains).
     Filename: {subject_id}_{hand}_{spectrum}_{iteration}.jpg
-    Identity label = subject_id + "_" + hand  (e.g. "001_l"), consistent
-    across all loaded spectra.
+    Identity label = subject_id + "_" + hand  (e.g. "001_l").
 
-    Train set: instantiate with train_domains  → all images from those domains.
-    Test  set: instantiate with test_domains   → all images from those domains.
-    There is NO per-identity image split; the domain list is the only criterion.
+    A shared_label_map is passed in so that train and test datasets use
+    the same integer label space. Train and test share the same identities,
+    so the map is built from train domains and passed to all datasets.
+    This ensures ArcFace head argmax predictions directly match test labels.
     """
-    def __init__(self, data_path, spectra):
+    def __init__(self, data_path, spectra, shared_label_map):
         self.to_tensor = transforms.Compose([
             transforms.Resize((112, 112)),
             transforms.ToTensor(),
@@ -89,10 +89,11 @@ class CASIASpectrum(Dataset):
                 os.path.join(data_path, fname)
             )
 
-        # Consistent label map over all loaded identities
-        self.label_map = {h: i for i, h in enumerate(sorted(class_to_imgs))}
+        self.label_map = shared_label_map
         self.samples   = []
         for hand_id, imgs in class_to_imgs.items():
+            if hand_id not in self.label_map:
+                continue
             label = self.label_map[hand_id]
             self.samples.extend((p, label) for p in imgs)
 
@@ -136,7 +137,7 @@ class MultiDatasetExtractors(nn.Module):
         self.n_datasets = n_datasets
         self.shared     = SharedLayers()
         with torch.no_grad():
-            flat_dim = self.shared(torch.zeros(1, 3, 224, 224)).view(1, -1).shape[1]
+            flat_dim = self.shared(torch.zeros(1, 3, 112, 112)).view(1, -1).shape[1]
         self.heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(flat_dim, 1024), nn.LeakyReLU(0.2, inplace=True),
@@ -160,34 +161,18 @@ class MultiDatasetExtractors(nn.Module):
 # ----------------------------
 def mkmmd_loss(f1, f2, kernels=(1, 5, 10, 20, 50, 100)):
     """
-    MK-MMD domain adaptation loss (L_ada, Eq. 8) applied on EXTRACTED FEATURES.
-
-    f1, f2 : feature tensors [B, d] — L2-normalised embeddings from orig_feats.
-
-    RBF kernel: k(x, x') = exp(-||x - x'||^2 / bw)
-
-    Computed as:
-        MMD^2 = (1/A^2) sum_a sum_a' k(f1_a, f1_a')
-              - (2/AB)  sum_a sum_b   k(f1_a, f2_b)
-              + (1/B^2) sum_b sum_b'  k(f2_b, f2_b')
-
-    Squared distances are computed directly via the identity:
-        ||x - y||^2 = ||x||^2 + ||y||^2 - 2<x, y>
-    This avoids the sqrt+pow(2) redundancy of torch.cdist and is numerically
-    safer with .clamp(min=0) to prevent tiny negatives from floating point.
-
-    Final loss averages over all kernel bandwidths (MK-MMD).
+    MK-MMD domain adaptation loss (L_ada, Eq. 8) on EXTRACTED FEATURES.
+    Squared distances via ||x-y||^2 = ||x||^2 + ||y||^2 - 2<x,y> with clamp.
     """
     def sq_dists(a, b):
-        # ||a_i - b_j||^2 for all pairs -> [A, B]
-        aa = (a * a).sum(dim=1, keepdim=True)   # [A, 1]
-        bb = (b * b).sum(dim=1, keepdim=True)   # [B, 1]
-        ab = torch.mm(a, b.t())                  # [A, B]
+        aa = (a * a).sum(dim=1, keepdim=True)
+        bb = (b * b).sum(dim=1, keepdim=True)
+        ab = torch.mm(a, b.t())
         return (aa + bb.t() - 2 * ab).clamp(min=0)
 
-    d_ss = sq_dists(f1, f1)   # [A, A]
-    d_st = sq_dists(f1, f2)   # [A, B]
-    d_tt = sq_dists(f2, f2)   # [B, B]
+    d_ss = sq_dists(f1, f1)
+    d_st = sq_dists(f1, f2)
+    d_tt = sq_dists(f2, f2)
 
     loss = 0.0
     for bw in kernels:
@@ -200,24 +185,15 @@ def mkmmd_loss(f1, f2, kernels=(1, 5, 10, 20, 50, 100)):
 def consistent_loss(orig_feat, aug_feats_per_pair):
     """
     L_con (Eq. 9):
-        L_con = SUM_{n!=j} || f(x^Dj)^j  -  (1/N) SUM_{l=1}^{N} f(x^{Dj->Dn})^l ||^2
-
-    - Outer operation : SUM over n!=j  (N-1 terms) — NOT averaged, summed.
-    - Inner distance  : squared L2 norm ||a - b||^2 = SUM_k (a_k - b_k)^2
-                        NOT MSE which would divide by feature dim d.
-    - Aug average     : (1/N) over all N heads for each augmented image x^{Dj->Dn}.
-
-    aug_feats_per_pair: list of (N-1) elements, each a list of N tensors [B, d].
-    orig_feat        : [B, d] — f(x^Dj)^j, original image through its own head j.
+        L_con = SUM_{n!=j} || f(x^Dj)^j - (1/N) SUM_l f(x^{Dj->Dn})^l ||^2
+    Outer: SUM (not mean) over N-1 pairs.
+    Inner: squared L2 norm, averaged over batch.
     """
     loss = torch.tensor(0.0, device=orig_feat.device)
     for head_feats in aug_feats_per_pair:
-        # (1/N) Σ_{l=1}^{N} f(x^{Dj->Dn})^l  →  [B, d]
-        avg      = torch.stack(head_feats, dim=0).mean(0)
-        # || f(x^Dj)^j - avg ||^2  per sample, summed over feature dim, averaged over batch
-        sq_l2    = ((orig_feat - avg) ** 2).sum(dim=1)   # [B]
-        loss    += sq_l2.mean()                           # scalar, averaged over batch
-    # Outer SUM over n!=j (no division — paper uses Σ not mean)
+        avg   = torch.stack(head_feats, dim=0).mean(0)
+        sq_l2 = ((orig_feat - avg) ** 2).sum(dim=1)
+        loss += sq_l2.mean()
     return loss
 
 def triplet_loss_fn(anchor, positive, negative, margin=0.4):
@@ -229,31 +205,11 @@ def triplet_loss_fn(anchor, positive, negative, margin=0.4):
 
 def sample_triplet_pairs(aug_avg, aug_labels, anchor_labels):
     """
-    Mine positive and negative from aug_avg using identity labels.
-
-    Both positive and negative are drawn from aug_avg (the averaged augmented
-    feature across all heads and all style directions j!=i).
-
-    Positive: aug_avg[k] directly -- by Fourier aug construction, aug_avg[k]
-              always carries the same identity as anchor[k] (phase is preserved
-              from source domain Di), so no mining needed. Guaranteed
-              same-identity pairing at any batch size.
-
-    Negative: a randomly picked aug_avg[m] where aug_labels[m] != anchor_labels[k],
-              i.e. a different-identity augmented sample from the same batch.
-
-    Example -- batch of 4, anchor_labels = aug_labels = [3, 7, 3, 12]:
-      anchor[0] id=3  -> positive = aug_avg[0] (id=3, same position)
-                      -> negative pool where label!=3: indices [1,3] -> pick one
-      anchor[1] id=7  -> positive = aug_avg[1] (id=7, same position)
-                      -> negative pool where label!=7: indices [0,2,3] -> pick one
-      anchor[2] id=3  -> positive = aug_avg[2] (id=3, same position)
-                      -> negative pool where label!=3: indices [1,3] -> pick one
-      anchor[3] id=12 -> positive = aug_avg[3] (id=12, same position)
-                      -> negative pool where label!=12: indices [0,1,2] -> pick one
+    Positive: aug_avg[k] — same identity as anchor[k] by Fourier phase preservation.
+    Negative: aug_avg[m] where aug_labels[m] != anchor_labels[k].
     """
     B         = anchor_labels.size(0)
-    positives = aug_avg.clone()          # aug_avg[k] always same identity as anchor[k]
+    positives = aug_avg.clone()
     negatives = torch.zeros_like(aug_avg)
     for i in range(B):
         pool = (aug_labels != anchor_labels[i]).nonzero(as_tuple=False).squeeze(1)
@@ -264,42 +220,98 @@ def sample_triplet_pairs(aug_avg, aug_labels, anchor_labels):
     return positives, negatives
 
 # ----------------------------
-# 6. Data Loading
+# 6. EER helper
+# ----------------------------
+def compute_eer(scores_gen, scores_imp):
+    """
+    Compute EER from arrays of genuine and impostor similarity scores.
+    Returns EER as a percentage.
+    """
+    if len(scores_gen) == 0 or len(scores_imp) == 0:
+        return float("nan")
+    gen  = np.array(scores_gen)
+    imp  = np.array(scores_imp)
+    thrs = np.linspace(min(gen.min(), imp.min()), max(gen.max(), imp.max()), 500)
+    eer  = min(
+        ((abs((imp >= t).mean() - (gen < t).mean()),
+          ((imp >= t).mean() + (gen < t).mean()) / 2)
+         for t in thrs),
+        key=lambda x: x[0],
+    )[1] * 100
+    return eer
+
+# ----------------------------
+# 7. Data Loading
 # ----------------------------
 N = len(train_domains)
 
 print("Building datasets...")
 
-# One dataset per train domain: ALL images from that domain, no image-level split.
-# Train/test separation is purely by domain: train_domains -> training, test_domains -> evaluation.
-src_train = [CASIASpectrum(data_path, [s]) for s in train_domains]
+# ── Shared label map built from TRAIN domains ────────────────────────────────
+# Train and test sets share the same identities, so scanning train domains
+# is sufficient to build the full label map.
+# All datasets (train + test) receive this shared map so that integer label k
+# refers to the same hand_id everywhere — essential for ArcFace head accuracy:
+# source head argmax predictions directly correspond to test label integers.
+all_hand_ids = set()
+for fname in sorted(os.listdir(data_path)):
+    if not fname.lower().endswith(".jpg"):
+        continue
+    parts = fname[:-4].split("_")
+    if len(parts) != 4:
+        continue
+    subject_id, hand, spec, _ = parts
+    if spec in set(train_domains):       # only scan train domains
+        all_hand_ids.add(f"{subject_id}_{hand}")
+shared_label_map  = {h: i for i, h in enumerate(sorted(all_hand_ids))}
+num_total_classes = len(shared_label_map)
+print(f"  Shared identity space: {num_total_classes} identities (same in train & test)")
 
-# Test set: ALL images from the held-out target domain(s) -- used for all evaluation
-tgt_test  = CASIASpectrum(data_path, test_domains)
+src_train = [CASIASpectrum(data_path, [s], shared_label_map) for s in train_domains]
+tgt_test  = CASIASpectrum(data_path, test_domains, shared_label_map)
 
-# Per-domain infinite loaders for training
 train_loaders = [
     DataLoader(ds, batch_size=batch_size, shuffle=True,
-               num_workers=0, pin_memory=False, drop_last=True,
-               persistent_workers=False)
+               num_workers=0, pin_memory=False, drop_last=True)
     for ds in src_train
 ]
+test_loader = DataLoader(tgt_test, batch_size=batch_size, shuffle=False,
+                         num_workers=0, pin_memory=False)
 
-# Single loader used for every evaluation call
-test_loader = DataLoader(
-    tgt_test, batch_size=batch_size, shuffle=False,
-    num_workers=0, pin_memory=False,
-)
+# ── Split test set: gallery (1st image per identity) + query (rest) ──────────
+_tf = transforms.Compose([transforms.Resize((112, 112)), transforms.ToTensor()])
 
-num_classes_per_src = [len(ds.label_map) for ds in src_train]
-steps_per_epoch     = min(len(ld) for ld in train_loaders)
+class _ListDataset(Dataset):
+    def __init__(self, samples, transform):
+        self.samples, self.transform = samples, transform
+    def __len__(self):
+        return len(self.samples)
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        return self.transform(Image.open(path).convert("RGB")), label
+
+gallery_samples, query_samples = [], []
+_seen = set()
+for path, label in tgt_test.samples:
+    if label not in _seen:
+        _seen.add(label)
+        gallery_samples.append((path, label))
+    else:
+        query_samples.append((path, label))
+
+gallery_loader = DataLoader(_ListDataset(gallery_samples, _tf),
+                            batch_size=batch_size, shuffle=False,
+                            num_workers=0, pin_memory=False)
+query_loader   = DataLoader(_ListDataset(query_samples, _tf),
+                            batch_size=batch_size, shuffle=False,
+                            num_workers=0, pin_memory=False)
+
+steps_per_epoch = min(len(ld) for ld in train_loaders)
 
 class _Inf:
-    """Wraps a DataLoader so it never raises StopIteration."""
     def __init__(self, loader):
         self.loader = loader
         self._it    = iter(loader)
-
     def next(self):
         try:
             return next(self._it)
@@ -311,95 +323,168 @@ inf_loaders = [_Inf(ld) for ld in train_loaders]
 
 print(f"  Train domains     : {train_domains}  (N={N} heads)")
 print(f"  Test  domain      : {test_domains[0]}")
-print(f"  Classes per source: {num_classes_per_src}")
 print(f"  Train samples     : {[len(ds) for ds in src_train]}")
-print(f"  Test  samples     : {len(tgt_test)}")
+print(f"  Test  samples     : {len(tgt_test)}  "
+      f"(gallery={len(gallery_samples)}, query={len(query_samples)})")
 print(f"  Steps per epoch   : {steps_per_epoch}")
 print(f"  Device            : {device}\n")
 
 # ----------------------------
-# 7. Model & Optimizer Setup
+# 8. Model & Optimizer Setup
 # ----------------------------
 model = MultiDatasetExtractors(N, feature_dim).to(device)
 
-# One ArcFace head per source domain (label spaces are per-domain)
+# ArcFace heads use num_total_classes (shared space) so argmax predictions
+# are directly comparable to test set label integers.
 arc_heads = nn.ModuleList([
     pml_losses.ArcFaceLoss(
-        num_classes=nc, embedding_size=feature_dim,
+        num_classes=num_total_classes, embedding_size=feature_dim,
         margin=arcface_m, scale=arcface_s,
     ).to(device)
-    for nc in num_classes_per_src
+    for _ in range(N)
 ])
 
 all_params = list(model.parameters()) + list(arc_heads.parameters())
 optimizer  = optim.Adam(all_params, lr=lr)
 
 # ----------------------------
-# 8. Evaluation  (test_loader only)
+# 9. Evaluation
 # ----------------------------
 @torch.no_grad()
-def evaluate():
-    """
-    Rank-1 identification accuracy + EER on the target test set.
-    Features = average of all N head outputs (paper Section III).
-    Gallery and query are both the full test set; self-match is excluded.
-    """
-    model.eval()
-
-    all_feats, all_labels = [], []
-    for imgs, labels in test_loader:
+def _extract(loader):
+    """Extract averaged-head L2-normalised features for a loader."""
+    feats, labels = [], []
+    for imgs, lbl in loader:
         imgs = imgs.to(device)
         fs   = torch.stack(model.extract_all(imgs), dim=0).mean(0)
-        all_feats.append(F.normalize(fs, p=2, dim=1).cpu())
-        all_labels.append(labels)
+        feats.append(F.normalize(fs, p=2, dim=1).cpu())
+        labels.append(lbl)
+    return torch.cat(feats), torch.cat(labels)
 
-    all_feats  = torch.cat(all_feats)   # [M, d]
-    all_labels = torch.cat(all_labels)  # [M]
+@torch.no_grad()
+def evaluate():
+    model.eval()
+    for h in arc_heads:
+        h.eval()
 
-    # Rank-1 accuracy (self excluded)
-    sim = torch.mm(all_feats, all_feats.t())
-    sim.fill_diagonal_(-1.0)
-    pred = all_labels[sim.argmax(dim=1)]
-    acc  = (pred == all_labels).float().mean().item() * 100
+    # ── 1. Full similarity-based accuracy ───────────────────────────────────
+    # All M test images serve as both gallery and query.
+    # Cosine similarity matrix [M, M]; diagonal set to -1 to exclude self-match.
+    # Rank-1: each image's nearest neighbour (excluding itself) is its prediction.
+    # EER: all unique pairs (i<j) split into genuine / impostor by label equality.
+    all_feats, all_labels = _extract(test_loader)
+    M   = len(all_labels)
+    sim = torch.mm(all_feats, all_feats.t())   # [M, M] cosine similarity
+    sim.fill_diagonal_(-1.0)                   # exclude self-match
 
-    # EER
+    pred_full = all_labels[sim.argmax(dim=1)]
+    acc_full  = (pred_full == all_labels).float().mean().item() * 100
+
     sim_np = sim.numpy()
-    gen, imp = [], []
-    M = len(all_labels)
+    gen_full, imp_full = [], []
     for i in range(M):
-        for j in range(i + 1, M):
-            (gen if all_labels[i] == all_labels[j] else imp).append(sim_np[i, j])
+        for j in range(i + 1, M):          # upper triangle only (unique pairs)
+            s = sim_np[i, j]
+            (gen_full if all_labels[i] == all_labels[j] else imp_full).append(s)
+    eer_full = compute_eer(gen_full, imp_full)
 
-    if not gen or not imp:
-        print("  -> Not enough pairs for EER computation.")
-        return acc, float("nan")
+    # ── 2. Split similarity-based accuracy ──────────────────────────────────
+    # Gallery: first image per identity (registered template).
+    # Query  : all remaining images (probe set).
+    # Similarity matrix [Q, G]; no diagonal issue — sets are disjoint.
+    # Rank-1: each query matched to nearest gallery sample.
+    # EER: all (query_i, gallery_j) pairs split by label equality.
+    if len(query_samples) > 0:
+        gal_feats, gal_labels = _extract(gallery_loader)   # [G, d]
+        qry_feats, qry_labels = _extract(query_loader)     # [Q, d]
 
-    gen, imp = np.array(gen), np.array(imp)
-    thrs = np.linspace(
-        min(gen.min(), imp.min()), max(gen.max(), imp.max()), 500
-    )
-    eer = min(
-        (
-            (abs((imp >= t).mean() - (gen < t).mean()),
-             ((imp >= t).mean() + (gen < t).mean()) / 2)
-            for t in thrs
-        ),
-        key=lambda x: x[0],
-    )[1] * 100
+        sim_split = torch.mm(qry_feats, gal_feats.t())     # [Q, G]
+        pred_split = gal_labels[sim_split.argmax(dim=1)]
+        acc_split  = (pred_split == qry_labels).float().mean().item() * 100
 
-    print(f"  -> Test | Acc: {acc:.2f}%  EER: {eer:.2f}%")
-    return acc, eer
+        sim_split_np = sim_split.numpy()
+        gen_split, imp_split = [], []
+        for i in range(len(qry_labels)):
+            for j in range(len(gal_labels)):
+                s = sim_split_np[i, j]
+                (gen_split if qry_labels[i] == gal_labels[j] else imp_split).append(s)
+        eer_split = compute_eer(gen_split, imp_split)
+    else:
+        acc_split = eer_split = float("nan")
+
+    # ── 3. ArcFace head classification accuracy ─────────────────────────────
+    # Each ArcFace head has a weight matrix W: [num_total_classes, feature_dim].
+    # The rows of W are learned class prototype vectors.
+    # Classification score for class c = cosine_sim(feature, W[c])
+    #                                  = feature @ W[c] / (||feature|| ||W[c]||)
+    # Since extract() L2-normalises features, and we L2-normalise W rows,
+    # this reduces to: logits = feature @ W.t()  (pure dot product on unit sphere).
+    # argmax over classes → predicted identity integer.
+    # Because all datasets share the same label map, predicted integer directly
+    # matches test label integer — no remapping needed.
+    #
+    # Per-head accuracy: uses that head's feature extractor + that head's W.
+    # Ensemble accuracy: average logits across all N heads before argmax.
+
+    # Accumulate per-head logits over the full test set
+    per_head_logits = [[] for _ in range(N)]
+    all_test_labels = []
+
+    for imgs, lbl in test_loader:
+        imgs        = imgs.to(device)
+        shared_feat = model.shared(imgs).view(imgs.size(0), -1)
+        all_test_labels.append(lbl)
+        for hi in range(N):
+            feat = F.normalize(model.heads[hi](shared_feat), p=2, dim=1)  # [B, d]
+            # L2-normalise W rows: W has shape [num_total_classes, feature_dim]
+            W_norm = F.normalize(arc_heads[hi].W, p=2, dim=0).t()         # [num_total_classes, d]
+            logits = feat @ W_norm.t()                                     # [B, num_total_classes]
+            per_head_logits[hi].append(logits.cpu())
+
+    all_test_labels = torch.cat(all_test_labels)   # [M]
+    head_accs = []
+    stacked_logits = []
+
+    for hi in range(N):
+        logits_hi = torch.cat(per_head_logits[hi], dim=0)   # [M, num_total_classes]
+        stacked_logits.append(logits_hi)
+        pred_hi  = logits_hi.argmax(dim=1)
+        acc_hi   = (pred_hi == all_test_labels).float().mean().item() * 100
+        head_accs.append(acc_hi)
+
+    # Ensemble: average logits across all N heads, then argmax
+    ens_logits  = torch.stack(stacked_logits, dim=0).mean(0)   # [M, num_total_classes]
+    acc_arc_ens = (ens_logits.argmax(dim=1) == all_test_labels).float().mean().item() * 100
+
+    # ── Print results ────────────────────────────────────────────────────────
+    print(f"\n  ┌─ Evaluation on test domain '{test_domains[0]}' │ M={M} images")
+    print(f"  │")
+    print(f"  │  [1] Full similarity  "
+          f"│ Rank-1: {acc_full:6.2f}%  EER: {eer_full:5.2f}%"
+          f"  — all {M} images as gallery+query, self excluded")
+    if not np.isnan(acc_split):
+        print(f"  │  [2] Split similarity "
+              f"│ Rank-1: {acc_split:6.2f}%  EER: {eer_split:5.2f}%"
+              f"  — gallery={len(gallery_samples)}, query={len(query_samples)}")
+    else:
+        print(f"  │  [2] Split similarity │ N/A — each identity has only 1 image")
+    print(f"  │")
+    for hi, acc_hi in enumerate(head_accs):
+        print(f"  │  [3] ArcFace head {hi}   "
+              f"│ Acc: {acc_hi:6.2f}%"
+              f"  — domain '{train_domains[hi]}' head, {num_total_classes} classes")
+    print(f"  │  [3] ArcFace ensemble "
+          f"│ Acc: {acc_arc_ens:6.2f}%"
+          f"  — averaged logits over {N} heads")
+    print(f"  └{'─'*65}\n")
+
+    return acc_full, eer_full
 
 # ----------------------------
-# 9. Training
+# 10. Training
 # ----------------------------
 
 # ── Phase 1: Supervised pre-training (L_sup only) ────────────────────────────
-#
-# inf_loader[i] supplies batches exclusively for head i.
-# Fourier-augmented images x^{Di->Dj} — style of Dj, identity of Di — are
-# also fed through head i with Di's labels, forcing per-head style invariance.
-#
 print(f"{'='*60}")
 print(f"  Phase 1 — Supervised Pre-training  ({pretrain_epochs} epochs)")
 print(f"  L_sup on original + Fourier-augmented images per head")
@@ -421,7 +506,6 @@ for epoch in range(pretrain_epochs):
         loss = torch.tensor(0.0, device=device)
 
         for i, (src_imgs, src_lbl) in enumerate(batches):
-            # Original images → head i
             feat  = model.extract(src_imgs, i)
             loss += arc_heads[i](feat, src_lbl)
 
@@ -430,7 +514,6 @@ for epoch in range(pretrain_epochs):
                 epoch_corr  += (preds == src_lbl).sum().item()
                 epoch_total += src_lbl.size(0)
 
-            # Fourier-augmented x^{Di->Dj} → head i, same Di labels
             for j in range(N):
                 if i == j:
                     continue
@@ -451,13 +534,10 @@ for epoch in range(pretrain_epochs):
     print(f"  Epoch [{epoch+1}/{pretrain_epochs}]  "
           f"Loss: {avg_loss:.4f}  Train Acc: {avg_acc:.2f}%")
 
+    if (epoch + 1) % eval_every == 0:
+        evaluate()
+
 # ── Phase 2: Full PDFG training (all losses, Eq. 11) ─────────────────────────
-#
-# L_sup : original + Fourier-aug → own domain head     (style invariance)
-# L_con : Fourier-aug → ALL N heads → consistency      (Eq. 9)
-# L_d-t : triplet anchor=orig, pos=rolled orig, neg=diff-id aug  (Eq. 10)
-# L_ada : MK-MMD between every pair of source domains  (Eq. 8)
-#
 print(f"\n{'='*60}")
 print(f"  Phase 2 — Full PDFG Training  ({epochs} epochs, Eq. 11)")
 print(f"  L = L_sup + L_ada + α·L_con + β·L_d-t")
@@ -479,7 +559,6 @@ for epoch in range(epochs):
             for imgs, lbl in (il.next() for il in inf_loaders)
         ]
 
-        # Pre-compute all Fourier-augmented pairs x^{Di->Dj}  (i != j)
         aug = {}
         for i in range(N):
             src_imgs, src_lbl = batches[i]
@@ -501,7 +580,6 @@ for epoch in range(epochs):
             feat  = model.extract(src_imgs, i)
             l_sup = arc_heads[i](feat, src_lbl)
             orig_feats.append(feat)
-
             loss       += l_sup
             log["sup"] += l_sup.item()
 
@@ -510,7 +588,6 @@ for epoch in range(epochs):
                 epoch_corr  += (preds == src_lbl).sum().item()
                 epoch_total += src_lbl.size(0)
 
-            # Fourier-aug → same head i, same Di labels
             for j in range(N):
                 if i == j:
                     continue
@@ -521,9 +598,7 @@ for epoch in range(epochs):
 
         # ── L_con + L_d-t ────────────────────────────────────────────────
         for i in range(N):
-            aug_head_feats  = []   # list over j≠i: each is a list of N tensors [B,d]
-            aug_labels_list = []
-
+            aug_head_feats, aug_labels_list = [], []
             for j in range(N):
                 if i == j:
                     continue
@@ -531,37 +606,20 @@ for epoch in range(epochs):
                 aug_head_feats.append(model.extract_all(aug_imgs))
                 aug_labels_list.append(aug_lbl)
 
-            # L_con: avg over all N heads per pair (Eq. 9)
             l_con       = alpha * consistent_loss(orig_feats[i], aug_head_feats)
             loss       += l_con
             log["con"] += l_con.item()
 
-            # L_d-t (Eq. 10):
-            #   anchor   = source feature of person A, domain i  (real image)
-            #   positive = aug_avg[k] of person A (same identity, augmented)
-            #              Fourier aug preserves phase (identity) from Di,
-            #              so aug_avg[k] is always the same identity as anchor[k].
-            #              Guaranteed same-identity pairing at any batch size.
-            #   negative = aug_avg[m] of person B (different identity, augmented)
-            #              mined from the batch by label mismatch.
-            # D_ap  = dist(source_A, aug_avg_A)  <- same identity, source vs aug
-            # Dc-an = dist(source_A, aug_avg_B)  <- diff identity, source vs aug
             src_labels_i = batches[i][1]
             aug_avg      = torch.stack(
                 [torch.stack(hf, 0).mean(0) for hf in aug_head_feats], 0
             ).mean(0)
             pos, neg = sample_triplet_pairs(aug_avg, aug_labels_list[0], src_labels_i)
-            l_dt     = beta * triplet_loss_fn(
-                orig_feats[i], pos, neg, triplet_margin
-            )
+            l_dt     = beta * triplet_loss_fn(orig_feats[i], pos, neg, triplet_margin)
             loss       += l_dt
             log["dt"]  += l_dt.item()
 
-        # ── L_ada: MK-MMD between every source domain pair ───────────────
-        # Applied on EXTRACTED FEATURES (orig_feats[i], orig_feats[j]).
-        # Aligns the learned feature distributions of different source domains
-        # so the shared layers generalise to the unseen test domain.
-        # Squared distances computed directly (no sqrt+pow redundancy, clamped).
+        # ── L_ada ────────────────────────────────────────────────────────
         for i in range(N):
             for j in range(i + 1, N):
                 l_ada       = mkmmd_loss(orig_feats[i], orig_feats[j])
@@ -584,9 +642,9 @@ for epoch in range(epochs):
     )
 
     if (epoch + 1) % eval_every == 0:
-        acc, eer = evaluate()
-        if not np.isnan(eer) and eer < best_eer:
-            best_eer = eer
+        acc_full, eer_full = evaluate()
+        if not np.isnan(eer_full) and eer_full < best_eer:
+            best_eer = eer_full
             torch.save(
                 {
                     "model"    : model.state_dict(),
@@ -595,7 +653,7 @@ for epoch in range(epochs):
                 },
                 "best_model.pth",
             )
-            print(f"  ✓ New best EER: {eer:.2f}%  -> saved best_model.pth")
+            print(f"  ✓ New best EER: {eer_full:.2f}%  -> saved best_model.pth")
         print()
 
 print(f"\nDone. Best EER: {best_eer:.2f}%")

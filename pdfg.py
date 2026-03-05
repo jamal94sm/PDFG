@@ -15,8 +15,8 @@ from tqdm import tqdm
 # 1. Configuration
 # ----------------------------
 data_path     = "/home/pai-ng/Jamal/CASIA-MS-ROI"
-train_domains = ["460", "630"]
-test_domains  = ["940"]
+train_domains = ["460", "WHT"]
+test_domains  = ["700"]
 
 batch_size      = 8
 lr              = 1e-4
